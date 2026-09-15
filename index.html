@@ -533,12 +533,13 @@ function catInfo(key){ for(var i=0;i<CATEGORIES.length;i++){ if(CATEGORIES[i].ke
 /* ============================== state ================================= */
 var state = {
   view: "closet",
-  items: [],            // real, backed by db when available
-  favoriteDocs: [],      // from db: {docId, itemIds, createdAt}
-  localFavorites: [],    // session-only favorites {key, itemIds, createdAt}
+  items: [],            // real, backed by db or local storage when available
+  favoriteDocs: [],      // from Claude db: {docId, itemIds, createdAt}
+  localFavorites: [],    // from IndexedDB, or session-only when no storage at all
   generated: [],          // current outfit suggestions
   db: null,
   assetsApi: null,
+  storageMode: "memory", // "cloud" (Claude db/assets) | "local" (IndexedDB) | "memory" (session only)
   draft: null,           // {previewURL, blob, color, category, name}
   detailItem: null,
   selfPhoto: null,       // {assetId, photoSrc}
@@ -547,6 +548,110 @@ var state = {
 
 var SAMPLES = [];
 var tryOnCurrentOutfit = null;
+
+/* ======================= local (on-device) storage ======================= */
+var LOCAL_DB_NAME = "flatlay-db";
+var LOCAL_DB_VERSION = 1;
+var localDbPromise = null;
+function openLocalDb(){
+  if(localDbPromise) return localDbPromise;
+  localDbPromise = new Promise(function(resolve, reject){
+    if(!window.indexedDB){ reject(new Error("no indexeddb")); return; }
+    var req = indexedDB.open(LOCAL_DB_NAME, LOCAL_DB_VERSION);
+    req.onupgradeneeded = function(){
+      var db = req.result;
+      if(!db.objectStoreNames.contains("items")) db.createObjectStore("items", {keyPath:"id"});
+      if(!db.objectStoreNames.contains("favorites")) db.createObjectStore("favorites", {keyPath:"id"});
+      if(!db.objectStoreNames.contains("profile")) db.createObjectStore("profile", {keyPath:"id"});
+    };
+    req.onsuccess = function(){ resolve(req.result); };
+    req.onerror = function(){ reject(req.error); };
+  });
+  return localDbPromise;
+}
+function localPut(storeName, obj){
+  return openLocalDb().then(function(db){
+    return new Promise(function(resolve, reject){
+      var tx = db.transaction(storeName, "readwrite");
+      tx.objectStore(storeName).put(obj);
+      tx.oncomplete = function(){ resolve(obj); };
+      tx.onerror = function(){ reject(tx.error); };
+    });
+  });
+}
+function localDelete(storeName, id){
+  return openLocalDb().then(function(db){
+    return new Promise(function(resolve, reject){
+      var tx = db.transaction(storeName, "readwrite");
+      tx.objectStore(storeName).delete(id);
+      tx.oncomplete = function(){ resolve(); };
+      tx.onerror = function(){ reject(tx.error); };
+    });
+  });
+}
+function localGetAll(storeName){
+  return openLocalDb().then(function(db){
+    return new Promise(function(resolve, reject){
+      var tx = db.transaction(storeName, "readonly");
+      var req = tx.objectStore(storeName).getAll();
+      req.onsuccess = function(){ resolve(req.result); };
+      req.onerror = function(){ reject(req.error); };
+    });
+  });
+}
+function localGet(storeName, id){
+  return openLocalDb().then(function(db){
+    return new Promise(function(resolve, reject){
+      var tx = db.transaction(storeName, "readonly");
+      var req = tx.objectStore(storeName).get(id);
+      req.onsuccess = function(){ resolve(req.result); };
+      req.onerror = function(){ reject(req.error); };
+    });
+  });
+}
+function loadAllFromLocalDb(){
+  Promise.all([localGetAll("items"), localGetAll("favorites"), localGet("profile","main")]).then(function(results){
+    var items = results[0] || [], favs = results[1] || [], profile = results[2];
+    items.sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
+    state.items = items.map(function(it){
+      var copy = {};
+      for(var k in it){ if(it.hasOwnProperty(k)) copy[k] = it[k]; }
+      if(copy.photoBlob){ copy.photoSrc = URL.createObjectURL(copy.photoBlob); }
+      return copy;
+    });
+    state.localFavorites = favs.map(function(f){
+      var favItems = (f.itemIds||[]).map(function(id){ return state.items.find(function(i){ return i.id===id; }); }).filter(Boolean);
+      return {key:(f.itemIds||[]).slice().sort().join("|"), itemIds:f.itemIds, items:favItems, createdAt:f.createdAt, docId:f.id};
+    }).filter(function(f){ return f.items.length; });
+    if(profile && profile.photoBlob){ state.selfPhoto = {photoSrc: URL.createObjectURL(profile.photoBlob)}; }
+    render();
+  }).catch(function(e){ console.warn("local storage load failed", e); render(); });
+}
+function initStorage(){
+  if(window.claude && window.claude.use){
+    window.claude.use("db").then(function(db){
+      state.db = db;
+      if(!db) return null;
+      state.storageMode = "cloud";
+      return window.claude.use("assets");
+    }).then(function(assets){
+      if(state.db){
+        state.assetsApi = assets || null;
+        subscribeItems(); subscribeFavorites(); loadProfile();
+        render();
+      } else {
+        initLocalStorageMode();
+      }
+    }).catch(function(){ initLocalStorageMode(); });
+  } else {
+    initLocalStorageMode();
+  }
+}
+function initLocalStorageMode(){
+  if(!window.indexedDB){ state.storageMode = "memory"; render(); return; }
+  state.storageMode = "local";
+  loadAllFromLocalDb();
+}
 
 /* ============================ color math =============================== */
 function rgbToHsl(r,g,b){
@@ -775,7 +880,7 @@ function currentFavorites(){
     return {key: fd.itemIds.slice().sort().join("|"), items:items, docId:fd.docId, label:harmonyLabel(items)};
   }).filter(Boolean);
   var local = state.localFavorites.map(function(lf){
-    return {key:lf.key, items:lf.items, local:true, label:harmonyLabel(lf.items)};
+    return {key:lf.key, items:lf.items, local:true, docId:lf.docId, label:harmonyLabel(lf.items)};
   });
   return real.concat(local);
 }
@@ -788,6 +893,7 @@ function toggleFavorite(outfit){
     if(existing.local){
       state.localFavorites = state.localFavorites.filter(function(f){ return f.key!==outfit.key; });
       render();
+      if(state.storageMode==="local" && existing.docId){ localDelete("favorites", existing.docId).catch(function(){}); }
     } else {
       state.favoriteDocs = state.favoriteDocs.filter(function(fd){ return fd.docId!==existing.docId; });
       render();
@@ -796,14 +902,18 @@ function toggleFavorite(outfit){
     return;
   }
   var hasSample = outfit.items.some(function(i){ return i.sample; });
-  if(!hasSample && state.db){
+  if(!hasSample && state.storageMode==="cloud" && state.db){
     state.db.collection("favorites").add({
       itemIds: outfit.items.map(function(i){return i.id;}),
       createdAt: new Date().toISOString()
     }).catch(function(){ toast("Couldn't save this look — try again"); });
-  } else {
-    state.localFavorites = [{key:outfit.key, itemIds:outfit.items.map(function(i){return i.id;}), items:outfit.items, createdAt:Date.now()}].concat(state.localFavorites);
-    render();
+    return;
+  }
+  var favId = "fav-"+Date.now()+"-"+Math.random().toString(36).slice(2,7);
+  state.localFavorites = [{key:outfit.key, itemIds:outfit.items.map(function(i){return i.id;}), items:outfit.items, createdAt:Date.now(), docId:favId}].concat(state.localFavorites);
+  render();
+  if(!hasSample && state.storageMode==="local"){
+    localPut("favorites", {id:favId, itemIds:outfit.items.map(function(i){return i.id;}), createdAt:Date.now()}).catch(function(){});
   }
 }
 
@@ -999,11 +1109,14 @@ function handleSelfFileChosen(e){
   state.selfPhoto = {photoSrc:url, assetId:null};
   renderTryOnModal();
   render();
-  if(!state.db || !state.assetsApi) return;
-  state.assetsApi.upload(file).then(function(up){
-    state.selfPhoto.assetId = up.id;
-    return state.db.collection("profile").doc("main").set({assetId:up.id, updatedAt:new Date().toISOString()});
-  }).catch(function(){ toast("Couldn't save your photo, but it'll work for this visit."); });
+  if(state.storageMode==="cloud" && state.db && state.assetsApi){
+    state.assetsApi.upload(file).then(function(up){
+      state.selfPhoto.assetId = up.id;
+      return state.db.collection("profile").doc("main").set({assetId:up.id, updatedAt:new Date().toISOString()});
+    }).catch(function(){ toast("Couldn't save your photo, but it'll work for this visit."); });
+  } else if(state.storageMode==="local"){
+    localPut("profile", {id:"main", photoBlob:file, updatedAt:Date.now()}).catch(function(){ toast("Couldn't save your photo on this device."); });
+  }
 }
 function loadProfile(){
   state.db.collection("profile").doc("main").get().then(function(snap){
@@ -1084,8 +1197,12 @@ function renameItem(item, newLabel){
   if(idx>-1) state.items[idx].label = newLabel;
   item.label = newLabel;
   render();
-  if(state.db && item.assetId){
+  if(state.storageMode==="cloud" && state.db && item.assetId){
     state.db.collection("items").doc(item.id).update({label:newLabel}).catch(function(){ toast("Couldn't save the name"); });
+  } else if(state.storageMode==="local"){
+    localGet("items", item.id).then(function(rec){
+      if(rec){ rec.label = newLabel; return localPut("items", rec); }
+    }).catch(function(){ toast("Couldn't save the name"); });
   }
 }
 
@@ -1097,11 +1214,13 @@ function deleteItem(item){
   }
   state.items = state.items.filter(function(i){ return i.id!==item.id; });
   render();
-  if(state.db){
+  if(state.storageMode==="cloud" && state.db){
     state.db.collection("items").doc(item.id).delete().catch(function(){});
-  }
-  if(state.assetsApi && item.assetId){
-    state.assetsApi.delete(item.assetId).catch(function(){});
+    if(state.assetsApi && item.assetId){
+      state.assetsApi.delete(item.assetId).catch(function(){});
+    }
+  } else if(state.storageMode==="local"){
+    localDelete("items", item.id).catch(function(){});
   }
 }
 
@@ -1184,20 +1303,29 @@ function saveDraftItem(){
   };
   state.items = [optimistic].concat(state.items);
   render();
-  if(!state.db || !state.assetsApi){
-    return;
-  }
-  state.assetsApi.upload(d.blob).then(function(up){
-    return state.db.collection("items").add({
-      category: d.category, h:d.color.h, s:d.color.s, l:d.color.l, hex:d.color.hex,
-      assetId: up.id, label:name, createdAt: new Date().toISOString()
+
+  if(state.storageMode==="cloud" && state.db && state.assetsApi){
+    state.assetsApi.upload(d.blob).then(function(up){
+      return state.db.collection("items").add({
+        category: d.category, h:d.color.h, s:d.color.s, l:d.color.l, hex:d.color.hex,
+        assetId: up.id, label:name, createdAt: new Date().toISOString()
+      });
+    }).then(function(){
+      state.items = state.items.filter(function(i){ return i.id!==localId; });
+      render();
+    }).catch(function(err){
+      console.warn(err);
+      toast("Couldn't save that photo — it will disappear when you leave.");
     });
-  }).then(function(){
-    state.items = state.items.filter(function(i){ return i.id!==localId; });
-  }).catch(function(err){
-    console.warn(err);
-    toast("Couldn't save that photo — it will disappear when you leave.");
-  });
+  } else if(state.storageMode==="local"){
+    localPut("items", {
+      id: localId, category: d.category, h:d.color.h, s:d.color.s, l:d.color.l, hex:d.color.hex,
+      label:name, photoBlob:d.blob, createdAt: Date.now()
+    }).catch(function(err){
+      console.warn(err);
+      toast("Couldn't save that photo on this device.");
+    });
+  }
 }
 
 document.getElementById("fabAdd").addEventListener("click", openAddSheet);
@@ -1226,19 +1354,7 @@ function subscribeFavorites(){
 /* =============================== boot ==================================== */
 SAMPLES = buildSamples();
 render();
-
-(function initCapabilities(){
-  if(!window.claude || !window.claude.use){ return; }
-  window.claude.use("db").then(function(db){
-    state.db = db;
-    if(!db) return null;
-    return window.claude.use("assets");
-  }).then(function(assets){
-    state.assetsApi = assets || null;
-    if(state.db){ subscribeItems(); subscribeFavorites(); loadProfile(); }
-    render();
-  }).catch(function(e){ console.warn("capability init failed", e); });
-})();
+initStorage();
 
 if("serviceWorker" in navigator){
   window.addEventListener("load", function(){
