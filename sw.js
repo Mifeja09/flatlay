@@ -1,4 +1,4 @@
-const CACHE = "flatlay-shell-v1";
+const CACHE = "flatlay-shell-v2";
 const SHELL = ["./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (event) => {
@@ -26,18 +26,17 @@ self.addEventListener("fetch", (event) => {
   const isNav = req.mode === "navigate";
   if (!isShellFile && !isNav) return;
 
+  const cacheKey = isNav ? "./index.html" : req;
+
   event.respondWith(
-    caches.match(isNav ? "./index.html" : req).then((cached) => {
-      const network = fetch(req)
-        .then((res) => {
-          if (res && res.ok) {
-            const copy = res.clone();
-            caches.open(CACHE).then((cache) => cache.put(isNav ? "./index.html" : req, copy));
-          }
-          return res;
-        })
-        .catch(() => cached);
-      return cached || network;
-    })
+    fetch(req)
+      .then((res) => {
+        if (res && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE).then((cache) => cache.put(cacheKey, copy));
+        }
+        return res;
+      })
+      .catch(() => caches.match(cacheKey))
   );
 });
